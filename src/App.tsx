@@ -1,14 +1,185 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+
+interface Point {
+  x: number;
+  y: number;
+}
+
+interface CalibrationConfig {
+  grid_top_left: Point;
+  grid_bottom_right: Point;
+  btn_big: Point;
+  btn_small: Point;
+  chip_50: Point;
+  chip_250: Point;
+  chip_500: Point;
+  chip_2500: Point;
+}
+
+interface ScanStatus {
+  vertical_streak: number;
+  vertical_type: string;
+  horizontal_chop: number;
+  alert_triggered: boolean;
+  alert_reason: string;
+  last_cell: string;
+}
+
+const CALIBRATION_STEPS: { key: keyof CalibrationConfig; label: string }[] = [
+  { key: "grid_top_left", label: "1. Roadmap Top-Left Circle (Col 1, Row 1)" },
+  { key: "grid_bottom_right", label: "2. Roadmap Bottom-Right Circle (Col 12, Row 6)" },
+  { key: "btn_small", label: "3. SMALL (4-10) White Box" },
+  { key: "btn_big", label: "4. BIG (11-17) White Box" },
+  { key: "chip_50", label: "5. Chip [50]" },
+  { key: "chip_250", label: "6. Chip [250]" },
+  { key: "chip_500", label: "7. Chip [500]" },
+  { key: "chip_2500", label: "8. Chip [2.5K]" },
+];
 
 export default function App() {
   const [isRunning, setIsRunning] = useState(false);
   const [selectedChip, setSelectedChip] = useState<number>(50);
   const [showLoginModal, setShowLoginModal] = useState(false);
+  const [calibratingStep, setCalibratingStep] = useState<number | null>(null);
+  const [isRinging, setIsRinging] = useState(false);
+  const [alertReason, setAlertReason] = useState("");
+  const [status, setStatus] = useState<ScanStatus>({
+    vertical_streak: 0,
+    vertical_type: "-",
+    horizontal_chop: 0,
+    alert_triggered: false,
+    alert_reason: "",
+    last_cell: "-",
+  });
+
+  const [config, setConfig] = useState<CalibrationConfig>(() => {
+    const saved = localStorage.getItem("sicbo_calibration");
+    return saved
+      ? JSON.parse(saved)
+      : {
+          grid_top_left: { x: 0, y: 0 },
+          grid_bottom_right: { x: 0, y: 0 },
+          btn_big: { x: 0, y: 0 },
+          btn_small: { x: 0, y: 0 },
+          chip_50: { x: 0, y: 0 },
+          chip_250: { x: 0, y: 0 },
+          chip_500: { x: 0, y: 0 },
+          chip_2500: { x: 0, y: 0 },
+        };
+  });
+
   const [username, setUsername] = useState(() => localStorage.getItem("1x_user") || "");
   const [password, setPassword] = useState(() => localStorage.getItem("1x_pass") || "");
+  const ringIntervalRef = useRef<number | null>(null);
 
   const chips = [50, 250, 500, 2500];
+
+  // Sync saved calibration to Rust backend
+  useEffect(() => {
+    invoke("save_calibration", { config }).catch(console.error);
+  }, [config]);
+
+  // Sync selected chip with Rust backend
+  useEffect(() => {
+    invoke("set_selected_chip", { chip: selectedChip }).catch(console.error);
+  }, [selectedChip]);
+
+  // Listen to Rust pattern engine updates
+  useEffect(() => {
+    const unlistenScan = listen<ScanStatus>("scan-update", (event) => {
+      setStatus(event.payload);
+      if (event.payload.alert_triggered) {
+        setAlertReason(event.payload.alert_reason);
+        startRinging();
+      }
+    });
+
+    const unlistenStop = listen("stop-ringing", () => {
+      stopRinging();
+    });
+
+    const unlistenBet = listen<string>("bet-placed", (event) => {
+      stopRinging();
+      setAlertReason(`✅ ${event.payload} BET PLACED!`);
+      setTimeout(() => setAlertReason(""), 3000);
+    });
+
+    return () => {
+      unlistenScan.then((f) => f());
+      unlistenStop.then((f) => f());
+      unlistenBet.then((f) => f());
+    };
+  }, []);
+
+  // Capture mouse coordinate when pressing 'C' during Calibration Mode
+  useEffect(() => {
+    if (calibratingStep === null) return;
+
+    const handleKeyDown = async (e: KeyboardEvent) => {
+      if (e.key.toLowerCase() === "c") {
+        const pt = await invoke<Point>("get_mouse_position");
+        const stepKey = CALIBRATION_STEPS[calibratingStep].key;
+        const updated = { ...config, [stepKey]: pt };
+        setConfig(updated);
+        localStorage.setItem("sicbo_calibration", JSON.stringify(updated));
+
+        if (calibratingStep + 1 < CALIBRATION_STEPS.length) {
+          setCalibratingStep(calibratingStep + 1);
+        } else {
+          setCalibratingStep(null);
+        }
+      } else if (e.key === "Escape") {
+        setCalibratingStep(null);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [calibratingStep, config]);
+
+  const playRingBurst = () => {
+    try {
+      const ctx = new AudioContext();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "square";
+      osc.frequency.setValueAtTime(880, ctx.currentTime);
+      osc.frequency.setValueAtTime(1100, ctx.currentTime + 0.15);
+      gain.gain.setValueAtTime(0.35, ctx.currentTime);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.35);
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const startRinging = () => {
+    if (ringIntervalRef.current) return;
+    setIsRinging(true);
+    playRingBurst();
+    ringIntervalRef.current = window.setInterval(playRingBurst, 650);
+  };
+
+  const stopRinging = () => {
+    if (ringIntervalRef.current) {
+      clearInterval(ringIntervalRef.current);
+      ringIntervalRef.current = null;
+    }
+    setIsRinging(false);
+    setAlertReason("");
+    invoke("dismiss_alert").catch(console.error);
+  };
+
+  const handleToggleScan = async () => {
+    const nextState = !isRunning;
+    await invoke("toggle_scanning", { start: nextState }).catch(console.error);
+    setIsRunning(nextState);
+    if (!nextState) stopRinging();
+  };
 
   const handleNav = async (action: "back" | "forward" | "reload" | "home") => {
     try {
@@ -43,11 +214,11 @@ export default function App() {
   return (
     <div
       style={{
-        backgroundColor: "rgba(26, 26, 29, 0.96)",
+        backgroundColor: isRinging ? "rgba(140, 15, 15, 0.96)" : "rgba(26, 26, 29, 0.96)",
         color: "#ffffff",
         borderRadius: "12px",
         padding: "12px",
-        border: "1px solid #39ff14",
+        border: isRinging ? "2px solid #ff4d4d" : "1px solid #39ff14",
         fontFamily: "monospace",
         height: "100vh",
         boxSizing: "border-box",
@@ -57,7 +228,7 @@ export default function App() {
         userSelect: "none",
       }}
     >
-      {/* Draggable Header */}
+      {/* Draggable Header & Nav */}
       <div>
         <div
           data-tauri-drag-region
@@ -74,20 +245,36 @@ export default function App() {
           <span style={{ color: "#39ff14", fontWeight: "bold", fontSize: "13px" }}>
             🎲 SICBO TRACKER
           </span>
-          <button
-            onClick={() => setShowLoginModal(!showLoginModal)}
-            style={{
-              background: "#2a2a2e",
-              color: "#FF8534",
-              border: "1px solid #FF8534",
-              borderRadius: "6px",
-              padding: "3px 8px",
-              fontSize: "11px",
-              cursor: "pointer",
-            }}
-          >
-            🔑 Login
-          </button>
+          <div style={{ display: "flex", gap: "4px" }}>
+            <button
+              onClick={() => setCalibratingStep(calibratingStep === null ? 0 : null)}
+              style={{
+                background: "#2a2a2e",
+                color: "#39ff14",
+                border: "1px solid #39ff14",
+                borderRadius: "6px",
+                padding: "3px 7px",
+                fontSize: "10px",
+                cursor: "pointer",
+              }}
+            >
+              ⚙ Setup
+            </button>
+            <button
+              onClick={() => setShowLoginModal(!showLoginModal)}
+              style={{
+                background: "#2a2a2e",
+                color: "#FF8534",
+                border: "1px solid #FF8534",
+                borderRadius: "6px",
+                padding: "3px 7px",
+                fontSize: "10px",
+                cursor: "pointer",
+              }}
+            >
+              🔑 Login
+            </button>
+          </div>
         </div>
 
         {/* Browser Navigation Controls */}
@@ -111,8 +298,56 @@ export default function App() {
         </div>
       </div>
 
-      {/* Saved Login Drawer */}
-      {showLoginModal ? (
+      {/* Alert Banner when Ringing or Bet Placed */}
+      {alertReason && (
+        <div
+          style={{
+            background: isRinging ? "#ff0000" : "#15803d",
+            padding: "8px",
+            borderRadius: "8px",
+            textAlign: "center",
+            fontWeight: "bold",
+            fontSize: "11px",
+          }}
+        >
+          {isRinging ? `🔔 ${alertReason}` : alertReason}
+          {isRinging && (
+            <button
+              onClick={stopRinging}
+              style={{
+                display: "block",
+                width: "100%",
+                marginTop: "6px",
+                padding: "5px",
+                background: "#fff",
+                color: "#000",
+                border: "none",
+                borderRadius: "5px",
+                fontWeight: "bold",
+                cursor: "pointer",
+              }}
+            >
+              🔇 STOP RINGING (Space)
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Calibration Wizard / Login Drawer / Main Status */}
+      {calibratingStep !== null ? (
+        <div style={{ background: "#111", padding: "10px", borderRadius: "8px", fontSize: "11px" }}>
+          <div style={{ color: "#FF8534", fontWeight: "bold", marginBottom: "6px" }}>
+            CALIBRATION ({calibratingStep + 1}/{CALIBRATION_STEPS.length})
+          </div>
+          <div style={{ marginBottom: "8px", lineHeight: "1.4" }}>
+            Point mouse at:<br />
+            <strong style={{ color: "#39ff14" }}>{CALIBRATION_STEPS[calibratingStep].label}</strong>
+          </div>
+          <div style={{ color: "#aaa" }}>
+            Keep this box focused & press <strong style={{ color: "#fff" }}>[C]</strong> to capture. (ESC to cancel)
+          </div>
+        </div>
+      ) : showLoginModal ? (
         <div style={{ display: "flex", flexDirection: "column", gap: "8px", margin: "8px 0" }}>
           <input
             type="text"
@@ -154,12 +389,18 @@ export default function App() {
               </span>
             </div>
             <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "4px" }}>
+              <span style={{ color: "#aaa" }}>Last Drop:</span>
+              <strong style={{ color: "#FF8534" }}>{status.last_cell}</strong>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "4px" }}>
               <span style={{ color: "#aaa" }}>Vertical (4):</span>
-              <span>0 / 4</span>
+              <span>
+                {status.vertical_streak} / 4 ({status.vertical_type})
+              </span>
             </div>
             <div style={{ display: "flex", justifyContent: "space-between" }}>
               <span style={{ color: "#aaa" }}>Horiz Chop (6):</span>
-              <span>0 / 6</span>
+              <span>{status.horizontal_chop} / 6</span>
             </div>
           </div>
 
@@ -201,7 +442,7 @@ export default function App() {
       {/* Start / Stop Main Controls */}
       <div style={{ display: "flex", gap: "8px" }}>
         <button
-          onClick={() => setIsRunning(!isRunning)}
+          onClick={handleToggleScan}
           style={{
             flex: 1,
             padding: "10px",
