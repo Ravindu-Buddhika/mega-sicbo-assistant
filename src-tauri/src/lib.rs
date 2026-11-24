@@ -32,6 +32,7 @@ pub struct CalibrationConfig {
 pub struct ScanStatus {
     pub vertical_streak: usize,
     pub vertical_type: String,
+    pub vert3_sets: usize,
     pub horizontal_chop: usize,
     pub alert_triggered: bool,
     pub alert_reason: String,
@@ -121,7 +122,6 @@ fn auto_fill_login(app: AppHandle, username: String, password: String) -> Result
     }
 }
 
-// Sample a 9x9 area around (cx, cy) to reliably detect Gold ('B'), White ('S'), and Red ('T')
 fn classify_cell_area(img: &image::RgbaImage, cx: i32, cy: i32) -> char {
     let mut b_votes = 0;
     let mut s_votes = 0;
@@ -135,16 +135,11 @@ fn classify_cell_area(img: &image::RgbaImage, cx: i32, cy: i32) -> char {
                 let p = img.get_pixel(px as u32, py as u32);
                 let (r, g, b) = (p[0] as i32, p[1] as i32, p[2] as i32);
 
-                // White circle -> SMALL ('S'): R, G, B are all bright and close to each other
                 if r > 180 && g > 180 && b > 180 && (r - b).abs() < 35 {
                     s_votes += 1;
-                }
-                // Gold/Yellow circle -> BIG ('B'): High R & G, significantly lower Blue
-                else if r > 160 && g > 110 && (r - b) >= 40 && (g - b) >= 20 {
+                } else if r > 160 && g > 110 && (r - b) >= 40 && (g - b) >= 20 {
                     b_votes += 1;
-                }
-                // Red circle -> TRIPLE ('T'): High R, much lower G & B
-                else if r > 155 && (r - g) >= 65 && (r - b) >= 65 {
+                } else if r > 155 && (r - g) >= 65 && (r - b) >= 65 {
                     t_votes += 1;
                 }
             }
@@ -162,7 +157,6 @@ fn classify_cell_area(img: &image::RgbaImage, cx: i32, cy: i32) -> char {
     }
 }
 
-// Analyze 19x6 matrix from the rightmost column backwards
 fn evaluate_patterns(grid: &[[char; 6]; 19]) -> (usize, String, usize, bool, String, String) {
     let mut max_vert = 0;
     let mut vert_type = String::from("-");
@@ -171,7 +165,6 @@ fn evaluate_patterns(grid: &[[char; 6]; 19]) -> (usize, String, usize, bool, Str
     let mut alert = false;
     let mut reason = String::new();
 
-    // Find the rightmost populated column (0..18)
     let mut last_col: Option<usize> = None;
     for c in (0..19).rev() {
         if grid[c][0] != 'E' {
@@ -181,7 +174,6 @@ fn evaluate_patterns(grid: &[[char; 6]; 19]) -> (usize, String, usize, bool, Str
     }
 
     if let Some(lc) = last_col {
-        // 1. Last Drop: Lowest populated cell in the rightmost column
         for r in (0..6).rev() {
             if grid[lc][r] != 'E' {
                 last_cell = grid[lc][r].to_string();
@@ -189,13 +181,13 @@ fn evaluate_patterns(grid: &[[char; 6]; 19]) -> (usize, String, usize, bool, Str
             }
         }
 
-        // 2. Triple ('T') Check on the latest drop
+        // Triple ('T') Check
         if last_cell == "T" {
             alert = true;
             reason = "TRIPLE (T) DETECTED!".into();
         }
 
-        // 3. Vertical 4 Check: ONLY check the rightmost vertical column
+        // Vertical Streak Check (Rightmost column only)
         let top_char = grid[lc][0];
         if top_char == 'B' || top_char == 'S' {
             let mut count = 0;
@@ -217,8 +209,7 @@ fn evaluate_patterns(grid: &[[char; 6]; 19]) -> (usize, String, usize, bool, Str
             }
         }
 
-        // 4. Horizontal Chop 6: Scan backwards (Right -> Left) from rightmost column along Row 0
-        // Stop immediately if any column went down to Row 1, is 'T', or repeats the same color!
+        // Strict Horizontal Chop 6 (Right -> Left along Row 0)
         let mut chop_count = 0;
         let mut expected_char: Option<char> = None;
 
@@ -253,7 +244,6 @@ fn evaluate_patterns(grid: &[[char; 6]; 19]) -> (usize, String, usize, bool, Str
     (max_vert, vert_type, horiz_chop, alert, reason, last_cell)
 }
 
-// Executes exact Mega Sic Bo click order: BIG/SMALL first -> 150ms delay -> Chip
 fn execute_bet_click(cfg: &CalibrationConfig, is_big: bool, chip_val: i32) {
     let target_box = if is_big { &cfg.btn_big } else { &cfg.btn_small };
     let target_chip = match chip_val {
@@ -268,12 +258,10 @@ fn execute_bet_click(cfg: &CalibrationConfig, is_big: bool, chip_val: i32) {
     }
 
     if let Ok(mut enigo) = Enigo::new(&Settings::default()) {
-        // 1. Click BIG or SMALL box first so chips become clickable
         let _ = enigo.move_mouse(target_box.x, target_box.y, Coordinate::Abs);
         std::thread::sleep(Duration::from_millis(40));
         let _ = enigo.button(Button::Left, Direction::Click);
 
-        // 2. Wait 150ms for UI chips to activate, then click selected chip
         std::thread::sleep(Duration::from_millis(150));
         let _ = enigo.move_mouse(target_chip.x, target_chip.y, Coordinate::Abs);
         std::thread::sleep(Duration::from_millis(40));
@@ -299,6 +287,9 @@ async fn toggle_scanning(
 
         tokio::spawn(async move {
             let mut last_snapshot = [['E'; 6]; 19];
+            let mut vert3_sets: usize = 0;
+            let mut counted_this_column = false;
+            let mut prev_vert_streak: usize = 0;
 
             while *is_scanning.lock().unwrap() {
                 let cfg = config.lock().unwrap().clone();
@@ -323,8 +314,33 @@ async fn toggle_scanning(
 
                                 if grid != last_snapshot {
                                     last_snapshot = grid;
-                                    let (v_streak, v_type, h_chop, alert, reason, last_cell) =
+                                    let (v_streak, v_type, h_chop, mut alert, mut reason, last_cell) =
                                         evaluate_patterns(&grid);
+
+                                    // Detect transition to a new column (vertical streak reset to 1)
+                                    if v_streak == 1 && prev_vert_streak != 1 {
+                                        counted_this_column = false;
+                                    }
+                                    prev_vert_streak = v_streak;
+
+                                    // Vertical 3-Streak Sets Logic:
+                                    // - Increment when a vertical streak hits 3
+                                    // - Reset to 0 immediately if it reaches 4+
+                                    // - Trigger alarm & reset to 0 when 3 sets are reached
+                                    if v_streak == 3 && !counted_this_column {
+                                        counted_this_column = true;
+                                        vert3_sets += 1;
+
+                                        if vert3_sets >= 3 {
+                                            alert = true;
+                                            if reason.is_empty() {
+                                                reason = "3x VERTICAL-3 SETS REACHED!".into();
+                                            }
+                                            vert3_sets = 0;
+                                        }
+                                    } else if v_streak >= 4 {
+                                        vert3_sets = 0;
+                                    }
 
                                     if alert {
                                         *alert_active.lock().unwrap() = true;
@@ -333,6 +349,7 @@ async fn toggle_scanning(
                                     let status = ScanStatus {
                                         vertical_streak: v_streak,
                                         vertical_type: v_type,
+                                        vert3_sets,
                                         horizontal_chop: h_chop,
                                         alert_triggered: alert,
                                         alert_reason: reason,
@@ -373,7 +390,6 @@ pub fn run() {
         .setup(move |app| {
             let app_handle = app.handle().clone();
 
-            // Register Global Hotkeys: NumpadAdd / Equal (+) = BIG, NumpadSubtract / Minus (-) = SMALL, Space = Mute
             std::thread::spawn(move || {
                 let manager = GlobalHotKeyManager::new().expect("Failed to init hotkey manager");
                 let hk_big_num = HotKey::new(None, Code::NumpadAdd);
