@@ -5,7 +5,7 @@ use global_hotkey::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::time::sleep;
 use xcap::Monitor;
@@ -33,6 +33,7 @@ pub struct ScanStatus {
     pub vertical_streak: usize,
     pub vertical_type: String,
     pub vert3_sets: usize,
+    pub vert3_remaining_secs: u64,
     pub horizontal_chop: usize,
     pub alert_triggered: bool,
     pub alert_reason: String,
@@ -288,11 +289,27 @@ async fn toggle_scanning(
         tokio::spawn(async move {
             let mut last_snapshot = [['E'; 6]; 19];
             let mut vert3_sets: usize = 0;
+            let mut last_set_time: Option<Instant> = None;
             let mut counted_this_column = false;
             let mut prev_vert_streak: usize = 0;
+            let mut last_emitted_remaining: u64 = 0;
 
             while *is_scanning.lock().unwrap() {
                 let cfg = config.lock().unwrap().clone();
+
+                // Check 50-second expiry on active Vert-3 Sets
+                if let Some(t) = last_set_time {
+                    if t.elapsed().as_secs() > 50 {
+                        vert3_sets = 0;
+                        last_set_time = None;
+                    }
+                }
+
+                let remaining_secs = if let Some(t) = last_set_time {
+                    50u64.saturating_sub(t.elapsed().as_secs())
+                } else {
+                    0
+                };
 
                 if cfg.grid_bottom_right.x > cfg.grid_top_left.x
                     && cfg.grid_bottom_right.y > cfg.grid_top_left.y
@@ -312,44 +329,72 @@ async fn toggle_scanning(
                                     }
                                 }
 
-                                if grid != last_snapshot {
+                                let grid_changed = grid != last_snapshot;
+                                let timer_ticked = remaining_secs != last_emitted_remaining;
+
+                                if grid_changed || timer_ticked {
                                     last_snapshot = grid;
+                                    last_emitted_remaining = remaining_secs;
+
                                     let (v_streak, v_type, h_chop, mut alert, mut reason, last_cell) =
                                         evaluate_patterns(&grid);
 
-                                    // Detect transition to a new column (vertical streak reset to 1)
-                                    if v_streak == 1 && prev_vert_streak != 1 {
-                                        counted_this_column = false;
-                                    }
-                                    prev_vert_streak = v_streak;
-
-                                    // Vertical 3-Streak Sets Logic:
-                                    // - Increment when a vertical streak hits 3
-                                    // - Reset to 0 immediately if it reaches 4+
-                                    // - Trigger alarm & reset to 0 when 3 sets are reached
-                                    if v_streak == 3 && !counted_this_column {
-                                        counted_this_column = true;
-                                        vert3_sets += 1;
-
-                                        if vert3_sets >= 3 {
-                                            alert = true;
-                                            if reason.is_empty() {
-                                                reason = "3x VERTICAL-3 SETS REACHED!".into();
-                                            }
-                                            vert3_sets = 0;
+                                    if grid_changed {
+                                        // Reset per-column lock when a new column starts
+                                        if v_streak == 1 && prev_vert_streak != 1 {
+                                            counted_this_column = false;
                                         }
-                                    } else if v_streak >= 4 {
-                                        vert3_sets = 0;
+                                        prev_vert_streak = v_streak;
+
+                                        // Vertical 3-Streak Sets with 50s timeout rule:
+                                        if v_streak == 3 && !counted_this_column {
+                                            counted_this_column = true;
+
+                                            let within_50s = match last_set_time {
+                                                Some(t) => t.elapsed().as_secs() <= 50,
+                                                None => false,
+                                            };
+
+                                            if within_50s {
+                                                vert3_sets += 1;
+                                            } else {
+                                                // Timed out (>50s) or first set -> start fresh at 1
+                                                vert3_sets = 1;
+                                            }
+
+                                            // Reset 50s countdown from this set
+                                            last_set_time = Some(Instant::now());
+
+                                            if vert3_sets >= 3 {
+                                                alert = true;
+                                                if reason.is_empty() {
+                                                    reason = "3x VERTICAL-3 SETS (50s)!".into();
+                                                }
+                                                vert3_sets = 0;
+                                                last_set_time = None;
+                                            }
+                                        } else if v_streak >= 4 {
+                                            // 4th drop broke the 3-streak set -> reset to 0
+                                            vert3_sets = 0;
+                                            last_set_time = None;
+                                        }
+
+                                        if alert {
+                                            *alert_active.lock().unwrap() = true;
+                                        }
                                     }
 
-                                    if alert {
-                                        *alert_active.lock().unwrap() = true;
-                                    }
+                                    let updated_remaining = if let Some(t) = last_set_time {
+                                        50u64.saturating_sub(t.elapsed().as_secs())
+                                    } else {
+                                        0
+                                    };
 
                                     let status = ScanStatus {
                                         vertical_streak: v_streak,
                                         vertical_type: v_type,
                                         vert3_sets,
+                                        vert3_remaining_secs: updated_remaining,
                                         horizontal_chop: h_chop,
                                         alert_triggered: alert,
                                         alert_reason: reason,

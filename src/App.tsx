@@ -22,6 +22,7 @@ interface ScanStatus {
   vertical_streak: number;
   vertical_type: string;
   vert3_sets: number;
+  vert3_remaining_secs: number;
   horizontal_chop: number;
   alert_triggered: boolean;
   alert_reason: string;
@@ -50,6 +51,7 @@ export default function App() {
     vertical_streak: 0,
     vertical_type: "-",
     vert3_sets: 0,
+    vert3_remaining_secs: 0,
     horizontal_chop: 0,
     alert_triggered: false,
     alert_reason: "",
@@ -78,17 +80,14 @@ export default function App() {
 
   const chips = [50, 250, 500, 2500];
 
-  // Sync saved calibration to Rust backend
   useEffect(() => {
     invoke("save_calibration", { config }).catch(console.error);
   }, [config]);
 
-  // Sync selected chip with Rust backend
   useEffect(() => {
     invoke("set_selected_chip", { chip: selectedChip }).catch(console.error);
   }, [selectedChip]);
 
-  // Listen to Rust pattern engine updates
   useEffect(() => {
     const unlistenScan = listen<ScanStatus>("scan-update", (event) => {
       setStatus(event.payload);
@@ -115,7 +114,6 @@ export default function App() {
     };
   }, []);
 
-  // Capture mouse coordinate when pressing 'C' during Calibration Mode
   useEffect(() => {
     if (calibratingStep === null) return;
 
@@ -404,6 +402,9 @@ export default function App() {
               <span style={{ color: "#aaa" }}>Vert-3 Sets (3):</span>
               <span style={{ color: status.vert3_sets > 0 ? "#39ff14" : "#fff", fontWeight: "bold" }}>
                 {status.vert3_sets} / 3
+                {status.vert3_sets > 0 && status.vert3_remaining_secs > 0
+                  ? ` (${status.vert3_remaining_secs}s)`
+                  : ""}
               </span>
             </div>
             <div style={{ display: "flex", justifyContent: "space-between" }}>
