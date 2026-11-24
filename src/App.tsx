@@ -21,6 +21,7 @@ interface CalibrationConfig {
 interface ScanStatus {
   vertical_streak: number;
   vertical_type: string;
+  vert3_sets: number;
   horizontal_chop: number;
   alert_triggered: boolean;
   alert_reason: string;
@@ -29,7 +30,7 @@ interface ScanStatus {
 
 const CALIBRATION_STEPS: { key: keyof CalibrationConfig; label: string }[] = [
   { key: "grid_top_left", label: "1. Roadmap Top-Left Circle (Col 1, Row 1)" },
-  { key: "grid_bottom_right", label: "2. Roadmap Bottom-Right Circle (Col 12, Row 6)" },
+  { key: "grid_bottom_right", label: "2. Roadmap Bottom-Right Circle (Col 19, Row 6)" },
   { key: "btn_small", label: "3. SMALL (4-10) White Box" },
   { key: "btn_big", label: "4. BIG (11-17) White Box" },
   { key: "chip_50", label: "5. Chip [50]" },
@@ -48,6 +49,7 @@ export default function App() {
   const [status, setStatus] = useState<ScanStatus>({
     vertical_streak: 0,
     vertical_type: "-",
+    vert3_sets: 0,
     horizontal_chop: 0,
     alert_triggered: false,
     alert_reason: "",
@@ -396,6 +398,12 @@ export default function App() {
               <span style={{ color: "#aaa" }}>Vertical (4):</span>
               <span>
                 {status.vertical_streak} / 4 ({status.vertical_type})
+              </span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "4px" }}>
+              <span style={{ color: "#aaa" }}>Vert-3 Sets (3):</span>
+              <span style={{ color: status.vert3_sets > 0 ? "#39ff14" : "#fff", fontWeight: "bold" }}>
+                {status.vert3_sets} / 3
               </span>
             </div>
             <div style={{ display: "flex", justifyContent: "space-between" }}>
